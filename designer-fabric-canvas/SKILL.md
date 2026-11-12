@@ -1,6 +1,6 @@
 ---
 name: designer-fabric-canvas
-description: Fabric.js canvas, layers, hooks, and editor undo/redo architecture. Use when touching canvas objects, layer management (addToContentsLayer, LayerUtils), canvas event hooks (useFabricCanvas, useFabricCanvasHandler, useActiveFabricObject), custom fabric classes (PatternImage, fabricCustom.js), or editor history (saveCurrentState, muteUndoRedoStack).
+description: Fabric.js canvas, layers, hooks, memory management, and editor undo/redo architecture. Use when touching canvas objects, layer management (addToContentsLayer, LayerUtils), canvas event hooks (useFabricCanvas, useFabricCanvasHandler, useActiveFabricObject), custom fabric classes (PatternImage, fabricCustom.js), canvas memory (fabricMemory.js, withTempCanvas, releaseCanvas), or editor history (saveCurrentState, muteUndoRedoStack).
 ---
 
 # Designer Fabric Canvas
@@ -204,3 +204,69 @@ A custom image class (`fabric.util.createClass(fabric.Image)`) supporting tiled 
 2. **Repainting**: Always call `canvas.requestRenderAll()` (or `canvas.renderAll()`) after changes.
 3. **Dirty Flags**: If caching is enabled on groups or custom shapes, call `obj.markDirty()` to invalidate the cached canvas.
 4. **Group Coordinates**: To get absolute canvas coordinates of an object inside a group/layer, use `getAbsoluteTransform(obj)` from `objectUtils.js`.
+
+---
+
+## 5. Canvas Memory Management (`fabricMemory.js` & Safari Limits)
+
+iPad Safari and mobile browsers enforce a strict memory ceiling on all `<canvas>` elements (~384 MB total). Browsers **do not** release canvas pixel buffers when a JavaScript canvas variable goes out of scope; they only release memory when a canvas is garbage collected.
+
+To force immediate memory reclamation, canvases no longer needed are **shrunk to 0x0** (`width = 0; height = 0`), which immediately frees their GPU backing store.
+
+### Memory Helpers on `fabric.util`
+
+Installed globally on `fabric.util` at application startup (from `src/App/modules/Editor/fabricMemory.js`):
+
+#### 1. Temporary Offscreen Canvases: `fabric.util.withTempCanvas()`
+**Always** use this instead of creating raw `<canvas>` elements for temporary operations (e.g. reading pixel data, calculating contours, downsampling images, rasterizing SVG, reading magic wand masks):
+
+```javascript
+// Good — canvas backing store is automatically shrunk to 0x0 upon completion or error
+const pixelData = fabric.util.withTempCanvas(width, height, (ctx, tempCanvas) => {
+  ctx.drawImage(sourceImage, 0, 0, width, height);
+  return ctx.getImageData(0, 0, width, height).data;
+});
+
+// Also works seamlessly with async / Promises:
+const dataUrl = await fabric.util.withTempCanvas(width, height, async (ctx, tempCanvas) => {
+  await renderSomething(ctx);
+  return tempCanvas.toDataURL('image/png');
+});
+
+// Bad — leaks backing store in Safari memory until GC!
+const tempCanvas = document.createElement('canvas');
+tempCanvas.width = width;
+tempCanvas.height = height;
+// ... no releaseCanvas() ...
+```
+
+#### 2. Immediate Canvas Memory Release: `fabric.util.releaseCanvas()`
+Forces immediate freeing of a canvas's backing store:
+```javascript
+fabric.util.releaseCanvas(canvasElement);
+```
+
+#### 3. Creating Canvases To Keep: `fabric.util.drawToNewCanvas()`
+Creates a new canvas and draws into it. If the `draw` callback throws an error, the canvas is automatically released:
+```javascript
+const canvas = fabric.util.drawToNewCanvas(width, height, (ctx, c) => {
+  ctx.drawImage(source, 0, 0);
+});
+// When the caller is permanently done with this canvas:
+fabric.util.releaseCanvas(canvas);
+```
+
+#### 4. Disposing Temporary Fabric Objects: `fabric.util.disposeObjects()`
+When creating temporary clones or calculation objects, dispose them to free cache canvases:
+```javascript
+fabric.util.disposeObjects([tempObject1, tempObject2]);
+```
+
+### Deep Disposal Architecture (`fabricCustom.js`)
+`fabricCustom.js` monkey-patches Fabric disposal so memory leaks are prevented automatically:
+- `fabric.Canvas.prototype.dispose` & `StaticCanvas.prototype.dispose`: Automatically shrink upper, lower, and cache canvas elements to 0x0.
+- `fabric.Group.prototype.dispose` (and `fabric.Layer`): Automatically recurses and disposes all nested child objects (`_objects`).
+- `fabric.Image.prototype.dispose`: Automatically releases its `_filteredEl` canvas and evicts GPU tile textures.
+- `fabric.PatternImage.prototype.dispose`: Automatically releases its source copy canvas (`releaseSourceCopy()`).
+- `fabric.Object.prototype._removeCacheCanvas`: Automatically zeroes the cache canvas.
+- `fabric.Object.prototype.isOnCanvas()`: Verifies if an object is still attached to an active canvas/layer tree.
